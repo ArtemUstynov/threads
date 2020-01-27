@@ -1,0 +1,210 @@
+#include <utility>
+
+#ifndef __PROGTEST__
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <climits>
+#include <cfloat>
+#include <cmath>
+#include <iostream>
+#include <iomanip>
+#include <algorithm>
+#include <numeric>
+#include <vector>
+#include <set>
+#include <list>
+#include <map>
+#include <unordered_set>
+#include <unordered_map>
+#include <queue>
+#include <stack>
+#include <deque>
+#include <memory>
+#include <functional>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include "progtest_solver.h"
+#include "sample_tester.h"
+
+using namespace std;
+#endif /* __PROGTEST__ */
+
+class OrderWrapper {
+public:
+    int cust_id;
+    AOrderList orderList;
+    set<AProducer> producers;
+
+    OrderWrapper(int cust_id, const AOrderList & orderList) : cust_id(cust_id), orderList(orderList) {}
+};
+
+class CWeldingCompany {
+public:
+
+    vector<AProducer> producers;
+    vector<ACustomer> customers;
+
+    vector<thread> cts;
+    vector<thread> wts;
+
+    unordered_map<int, APriceList> final_price_lists;
+    queue<OrderWrapper> q_ao_list;
+
+    int finish_cust = 0;
+    mutex m_add_pl, m_svt, m_customer, m_wait_pl, m_seq_sol;
+    condition_variable cv_add_pl, cv_serv_t;
+
+    void CustomerThreadFunction(int id, ACustomer customer) {
+
+        printf("id: %d", id);
+        while (true) {
+            OrderWrapper orderWrapper(id, customer->WaitForDemand());
+            //AOrderList orderList =; // order list
+
+            if (orderWrapper.orderList == nullptr) {
+                m_customer.lock();
+                finish_cust++;
+                m_customer.unlock();
+                return;
+            }
+
+            m_add_pl.lock();
+            if (final_price_lists.find(orderWrapper.orderList->m_MaterialID) == final_price_lists.end()) {
+                for (auto & prod:producers) {
+                    prod->SendPriceList(orderWrapper.orderList->m_MaterialID); // void calls add price list
+                }
+
+                unique_lock<mutex> ul(m_wait_pl);
+                cv_add_pl.wait(ul, [this, &orderWrapper]() {
+                    return final_price_lists.find(orderWrapper.orderList->m_MaterialID) != final_price_lists.end();
+                });
+            }
+            m_add_pl.unlock();
+
+           /* for (auto & a : final_price_lists[orderWrapper.orderList->m_MaterialID]->m_List) {
+                printf("w: %d h: %d c: %lf\n", a.m_W, a.m_H, a.m_Cost);
+            }
+            printf("\n");*/
+
+            q_ao_list.push(orderWrapper);
+            cv_serv_t.notify_one();
+        }
+    }
+
+    void AddPriceList(AProducer prod, APriceList priceList) {
+        if (final_price_lists.find(priceList->m_MaterialID) == final_price_lists.end()) {
+            final_price_lists[priceList->m_MaterialID] = make_shared<CPriceList>(priceList->m_MaterialID);
+        }
+
+        for (auto & pl :priceList->m_List) {
+            bool duplicate = false;
+            if (final_price_lists[priceList->m_MaterialID]->m_List.empty()) {
+                final_price_lists[priceList->m_MaterialID]->m_List.push_back(pl);
+                continue;
+            }
+
+            for (auto & fpl : final_price_lists[priceList->m_MaterialID]->m_List) {
+                if ((pl.m_H == fpl.m_H && pl.m_W == fpl.m_W) || (pl.m_H == fpl.m_W && pl.m_W == fpl.m_H)) {
+                    fpl.m_Cost = (pl.m_Cost < fpl.m_Cost) ? pl.m_Cost : fpl.m_Cost;
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) final_price_lists[priceList->m_MaterialID]->m_List.push_back(pl);
+        }
+        cv_add_pl.notify_one();
+
+    }
+
+    void ServiceThreadFunction(int id) {
+
+        while (finish_cust != customers.size() || !q_ao_list.empty()) {
+            unique_lock<mutex> uniq_lock(m_svt);//uniq_lock
+            cv_serv_t.wait(uniq_lock, [this]() { return (finish_cust == customers.size() || !q_ao_list.empty()); });
+            if (finish_cust == customers.size() && q_ao_list.empty()) {
+                cv_serv_t.notify_one();
+                break;
+            }
+            if (q_ao_list.front().orderList == nullptr) {
+                q_ao_list.pop();
+                continue;
+            }
+            for (auto & order:q_ao_list.front().orderList->m_List) {
+                m_seq_sol.lock();
+                SeqSolve(final_price_lists[q_ao_list.front().orderList->m_MaterialID], order);
+                m_seq_sol.unlock();
+            }
+
+            customers[q_ao_list.front().cust_id]->Completed(q_ao_list.front().orderList);
+            q_ao_list.pop();
+            cv_serv_t.notify_one();
+        }
+    }
+
+    static void SeqSolve(APriceList priceList, COrder & order) { //static
+        vector<COrder> ord({order});
+        ProgtestSolver(ord, priceList);
+        order.m_Cost = ord[0].m_Cost;
+    };
+
+    void AddProducer(AProducer prod) {
+        producers.push_back(prod);
+    }
+
+    void AddCustomer(ACustomer cust) {
+        customers.push_back(cust);
+    }
+
+    void Start(unsigned thrCount) {
+
+        for (size_t id = 0; id < customers.size(); ++id) {
+            cts.emplace_back(&CWeldingCompany::CustomerThreadFunction, this, id, customers[id]);
+        }
+
+        for (size_t id = 0; id < thrCount; ++id) {
+            wts.emplace_back(&CWeldingCompany::ServiceThreadFunction, this, id);
+        }
+    }
+
+    void Stop(void) {
+        for (auto & c_thrd : cts) {
+            c_thrd.join();
+        }
+
+        for (auto & w_thrd : wts) {
+            w_thrd.join();
+        }
+    }
+
+
+};
+
+
+#ifndef __PROGTEST__
+
+int main(void) {
+    using namespace std::placeholders;
+
+    CWeldingCompany test;
+
+    AProducer p1 = make_shared<CProducerSync>(bind(&CWeldingCompany::AddPriceList, &test, _1, _2));
+    AProducerAsync p2 = make_shared<CProducerAsync>(bind(&CWeldingCompany::AddPriceList, &test, _1, _2));
+    test.AddProducer(p1);
+    test.AddProducer(p2);
+    test.AddCustomer(make_shared<CCustomerTest>(2));
+    test.AddCustomer(make_shared<CCustomerTest>(2));
+    /* test.AddCustomer(make_shared<CCustomerTest>(100000));
+     test.AddCustomer(make_shared<CCustomerTest>(100000));
+     test.AddCustomer(make_shared<CCustomerTest>(100000));*/
+    p2->Start();
+    test.Start(1);
+    test.Stop();
+    p2->Stop();
+    return 0;
+}
+
+#endif /* __PROGTEST__ */
